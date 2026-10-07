@@ -1,0 +1,32 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ---- 测试与调试产物 ----
+*.log
+tools/_out.*
+tools/_tk.*
+tools/_tmp*
+test-results/
+playwright-report/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 本项目 ----
+# 不要提交任何真实 API Key。密钥仅保存在浏览器 localStorage，
+# 若你自建了本地配置文件，请一并忽略。
+*.local
+secrets.json
+
+# ---- Secrets ----
+.env

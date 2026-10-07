@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>DataCleaner Pro · AI · 智能数据清洗</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">✨</span>
+      <span class="title">DataCleaner Pro <em>· AI</em></span>
+      <span class="badge">v2.0 · 智能数据清洗</span>
+    </div>
+    <div class="top-actions">
+      <span id="file-info" class="file-info">未加载数据</span>
+      <button id="btn-sample" class="btn">📦 加载示例</button>
+      <button id="btn-csv" class="btn">📂 打开文件</button>
+      <input type="file" id="file-input" accept=".csv,.tsv,.txt,.xlsx" hidden>
+      <button id="btn-suggest" class="btn">🔍 质量分析</button>
+      <button id="btn-ai-settings" class="btn">⚙ AI 设置</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- 左：数据预览 + 规则流水线 + 日志 -->
+    <section class="left-pane">
+      <div class="card">
+        <div class="card-head">
+          <h2>📊 数据预览</h2>
+          <div class="progress-wrap" id="progress-wrap">
+            <div class="progress-bar" id="progress-bar"></div>
+            <span id="progress-tip" class="progress-tip">就绪</span>
+          </div>
+        </div>
+        <div id="table-wrap" class="table-wrap"></div>
+        <div class="card-actions">
+          <button id="btn-run" class="btn primary">▶ 执行清洗</button>
+          <button id="btn-undo" class="btn">↶ 撤销</button>
+          <button id="btn-export" class="btn">⬇ 导出 CSV</button>
+          <button id="btn-export-xlsx" class="btn">⬇ 导出 Excel</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>🔧 规则流水线（9 条内置 + AI 智能）</h2>
+          <div class="preset-bar">
+            <select id="preset-select" class="preset-select" title="加载已保存的预设">
+              <option value="">— 预设 —</option>
+            </select>
+            <button id="btn-preset-save" class="btn-mini" title="把当前规则配置保存为预设">💾 保存</button>
+            <button id="btn-preset-del" class="btn-mini" title="删除当前选中的预设">🗑 删除</button>
+            <button id="btn-preset-export" class="btn-mini" title="导出全部预设为 JSON">⬆ 导出</button>
+            <button id="btn-preset-import" class="btn-mini" title="从 JSON 导入预设">⬇ 导入</button>
+            <input type="file" id="preset-file" accept=".json" hidden>
+          </div>
+        </div>
+        <div id="rules-list" class="rules-list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>📋 执行日志</h2>
+        </div>
+        <div id="ai-log" class="ai-log"></div>
+      </div>
+    </section>
+
+    <!-- 右：AI 智能清洗面板 -->
+    <section class="right-pane">
+      <div class="card ai-card">
+        <div class="card-head">
+          <h2>🤖 AI 智能清洗</h2>
+          <span class="ai-hint">用普通话描述您想要的效果</span>
+        </div>
+        <div class="ai-quick">
+          <span class="ai-quick-label">试试：</span>
+          <button class="chip" data-quick="把日期统一成 YYYY-MM-DD">📅 日期标准化</button>
+          <button class="chip" data-quick="把手机号中间四位用星号隐藏">📱 手机号脱敏</button>
+          <button class="chip" data-quick="删除完全重复的行">🗑 去重</button>
+          <button class="chip" data-quick="清理姓名列的空白">✨ 去空白</button>
+          <button class="chip" data-quick="把部门列的空值填为'未知'">🪣 填充空值</button>
+        </div>
+        <textarea id="ai-input" class="ai-input" rows="3" placeholder="例如：把第三列的手机号中间四位用星号隐藏，日期统一成 YYYY-MM-DD"></textarea>
+        <div class="ai-input-actions">
+          <button id="ai-send" class="btn primary">🚀 发送给 AI</button>
+          <button id="ai-stop" class="btn danger" style="display:none;">⏹ 停止</button>
+          <span class="ai-tip">提示：Ctrl+Enter 发送</span>
+        </div>
+        <div id="ai-response" class="ai-response"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>🔍 数据质量</h2>
+        </div>
+        <div id="quality-box" class="quality-box"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Modal -->
+  <div id="modal" class="modal">
+    <div class="modal-content">
+      <div class="modal-head">
+        <span></span>
+        <button id="modal-close" class="modal-close">×</button>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="js/rules.js"></script>
+  <script src="js/io.js"></script>
+  <script src="js/ai.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
