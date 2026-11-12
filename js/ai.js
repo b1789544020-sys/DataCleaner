@@ -311,31 +311,52 @@
   }
 
   // ---- Provider: WebLLM（本地） ----
-  async function runWebLLM({ instruction, headers, sampleRows, onChunk, signal }) {
-    await loadWebLLMLib();
-    const engine = await window.__dcWebLLMEnginePromise;
-    if (!engine) throw new Error('WebLLM 模型尚未初始化');
-    const messages = [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: '列名：' + JSON.stringify(headers) + '\n数据前 10 行：' + JSON.stringify((sampleRows || []).slice(0, 10)) + '\n\n用户指令：' + instruction },
-    ];
-    let acc = '';
-    const asyncGen = await engine.chat.completions.create({
-      messages,
-      temperature: 0.2,
-      stream: true,
-    });
-    for await (const chunk of asyncGen) {
-      if (signal && signal.aborted) throw new Error('aborted');
-      const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta && chunk.choices[0].delta.content;
-      if (delta) {
-        acc += delta;
-        onChunk && onChunk(acc, false);
+  async function runWebLLM({ instruction, headers, sampleRows, conversation, onChunk, signal, enginePromise }) {
+    if (signal && signal.aborted) throw new DOMException('已取消', 'AbortError');
+    let engine = null, rejectAbort = null;
+    const abortPromise = signal ? new Promise((resolve, reject) => { rejectAbort = reject; }) : null;
+    const onAbort = () => {
+      if (engine && typeof engine.interruptGenerate === 'function') {
+        try {
+          const pending = engine.interruptGenerate();
+          if (pending && pending.catch) pending.catch(() => {});
+        } catch (_) { /* 引擎销毁后仍应按取消结束，而不是变成未处理异常。 */ }
       }
+      if (rejectAbort) rejectAbort(new DOMException('已取消', 'AbortError'));
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    const withAbort = promise => signal ? Promise.race([promise, abortPromise]) : promise;
+    try {
+      await withAbort(loadWebLLMLib());
+      engine = await withAbort(enginePromise || window.__dcWebLLMEnginePromise);
+      if (!engine) throw new Error('WebLLM 模型尚未初始化');
+      const messages = [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...(conversation || []).slice(-12),
+        { role: 'user', content: '列名：' + JSON.stringify(headers) + '\n数据前 10 行：' + JSON.stringify((sampleRows || []).slice(0, 10)) + '\n\n用户指令：' + instruction },
+      ];
+      let acc = '';
+      const asyncGen = await withAbort(engine.chat.completions.create({
+        messages,
+        temperature: 0.2,
+        stream: true,
+      }));
+      const iterator = asyncGen[Symbol.asyncIterator] ? asyncGen[Symbol.asyncIterator]() : asyncGen;
+      while (true) {
+        const { value: chunk, done } = await withAbort(iterator.next());
+        if (done) break;
+        const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta && chunk.choices[0].delta.content;
+        if (delta) {
+          acc += delta;
+          onChunk && onChunk(acc, false);
+        }
+      }
+      onChunk && onChunk(acc, true);
+      const parsed = parseAIResponse(acc, headers);
+      return { fullText: acc, parsed };
+    } finally {
+      if (signal) signal.removeEventListener('abort', onAbort);
     }
-    onChunk && onChunk(acc, true);
-    const parsed = parseAIResponse(acc, headers);
-    return { fullText: acc, parsed };
   }
 
   async function initWebLLM(onProgress) {
@@ -346,8 +367,80 @@
       initProgressCallback: (rep) => {
         onProgress && onProgress(rep);
       },
+    }).catch(error => {
+      // 失败不能缓存成永久的 rejected Promise；用户修正网络/模型配置后应可重试。
+      window.__dcWebLLMEnginePromise = null;
+      throw error;
     });
     return window.__dcWebLLMEnginePromise;
+  }
+
+  const AI_STEP_TYPES = new Set([
+    'mask_column', 'normalize_date', 'fill_empty', 'trim_whitespace',
+    'remove_duplicates', 'split_column', 'rename_column', 'delete_column', 'custom_formula',
+  ]);
+  const COLUMN_STEPS = new Set([
+    'mask_column', 'normalize_date', 'fill_empty', 'trim_whitespace',
+    'split_column', 'rename_column', 'delete_column', 'custom_formula',
+  ]);
+
+  function validateAISteps(input, headers) {
+    const steps = [], errors = [];
+    if (!Array.isArray(input)) return { steps, errors: ['steps 必须是数组'] };
+    input.slice(0, 50).forEach((step, index) => {
+      const label = '步骤 ' + (index + 1);
+      if (!step || typeof step !== 'object' || Array.isArray(step)) {
+        errors.push(label + '：必须是对象'); return;
+      }
+      if (!AI_STEP_TYPES.has(step.type)) {
+        errors.push(label + '：不支持的类型 ' + String(step.type || '(空)')); return;
+      }
+      if (COLUMN_STEPS.has(step.type)) {
+        if (typeof step.column !== 'string' || !step.column.trim()) {
+          errors.push(label + '：缺少有效 column'); return;
+        }
+        if (Array.isArray(headers) && headers.indexOf(step.column) < 0) {
+          errors.push(label + '：找不到列 ' + step.column); return;
+        }
+      }
+      if (step.type === 'normalize_date' && step.target_format !== undefined
+          && !['YYYY-MM-DD', 'DD/MM/YYYY', 'MM/DD/YYYY', 'YYYY/MM/DD', 'YYYY.MM.DD'].includes(step.target_format)) {
+        errors.push(label + '：target_format 不受支持'); return;
+      }
+      if (step.type === 'fill_empty' && step.strategy !== undefined
+          && !['custom', 'mean', 'median'].includes(step.strategy)) {
+        errors.push(label + '：strategy 不受支持'); return;
+      }
+      if (step.type === 'mask_column' && step.pattern !== undefined
+          && (typeof step.pattern !== 'string' || !step.pattern || step.pattern.length > 200)) {
+        errors.push(label + '：pattern 必须是不超过 200 字符的非空字符串'); return;
+      }
+      if (step.type === 'split_column') {
+        if (step.separator !== undefined && (typeof step.separator !== 'string' || !step.separator || step.separator.length > 20)) {
+          errors.push(label + '：separator 必须是 1–20 字符'); return;
+        }
+        if (step.new_columns !== undefined && (!Array.isArray(step.new_columns)
+            || step.new_columns.length > 20 || step.new_columns.some(n => typeof n !== 'string' || !n.trim()))) {
+          errors.push(label + '：new_columns 必须是有效列名数组'); return;
+        }
+      }
+      if (step.type === 'rename_column'
+          && ![step.new_name, step.to].some(n => typeof n === 'string' && n.trim())) {
+        errors.push(label + '：缺少 new_name'); return;
+      }
+      if (step.type === 'custom_formula') {
+        const formula = step.formula || step.expression;
+        if (typeof formula !== 'string' || !formula.trim() || formula.length > 1000) {
+          errors.push(label + '：缺少有效 formula'); return;
+        }
+        try {
+          if (window.DCRules) window.DCRules.compileArithmetic(formula, headers ? headers.length : 10000);
+        } catch (e) { errors.push(label + '：' + e.message); return; }
+      }
+      steps.push(step);
+    });
+    if (input.length > 50) errors.push('最多接受 50 个步骤，其余已忽略');
+    return { steps, errors };
   }
 
   // ---- 解析 AI 响应中的 JSON 块 ----
@@ -370,14 +463,11 @@
         return { analysis: text, steps: [], error: 'JSON 解析失败：' + e.message };
       }
     }
-    const validSteps = (parsed.steps || []).filter(s => {
-      if (!s || !s.type) return false;
-      if (s.column !== undefined && headers && headers.length) {
-        return headers.indexOf(String(s.column)) >= 0;
-      }
-      return true;
-    });
-    return { analysis: parsed.analysis || '', steps: validSteps, raw: parsed };
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { analysis: text, steps: [], errors: ['AI 响应必须是 JSON 对象'], error: 'AI 响应必须是 JSON 对象' };
+    }
+    const validation = validateAISteps(parsed.steps || [], headers);
+    return { analysis: parsed.analysis || '', steps: validation.steps, errors: validation.errors, raw: parsed };
   }
 
   // ---- 简易 Markdown 渲染 ----
@@ -430,10 +520,12 @@
   async function chat({ provider, apiKey, instruction, headers, sampleRows, conversation, onChunk, signal, onProgress }) {
     if (provider === 'mock') return runMock({ instruction, headers, sampleRows, onChunk, signal });
     if (provider === 'webllm') {
-      if (!window.__dcWebLLMEnginePromise) {
-        await initWebLLM(onProgress);
-      }
-      return runWebLLM({ instruction, headers, sampleRows, onChunk, signal });
+      if (signal && signal.aborted) throw new DOMException('已取消', 'AbortError');
+      const enginePromise = window.__dcWebLLMEnginePromise || initWebLLM(rep => {
+        if ((!signal || !signal.aborted) && onProgress) onProgress(rep);
+      });
+      // 不等待权重下载才进入取消逻辑；底层下载可继续完成并供下一次复用。
+      return runWebLLM({ instruction, headers, sampleRows, conversation, onChunk, signal, enginePromise });
     }
     return runOpenAICompat({ provider, apiKey, instruction, headers, sampleRows, conversation, onChunk, signal });
   }
@@ -443,6 +535,7 @@
     SYSTEM_PROMPT,
     chat,
     parseAIResponse,
+    validateAISteps,
     renderMarkdown,
     heuristicSteps,
     initWebLLM,

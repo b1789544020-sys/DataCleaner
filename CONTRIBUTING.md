@@ -28,18 +28,26 @@ python -m http.server 8080
 # 浏览器测试需要 Playwright
 pip install playwright
 playwright install chromium
+# 跨浏览器套件另外需要：
+playwright install firefox webkit
 ```
 
 ## 提交前必须做的
 
-跑完整测试套件，**155 个用例必须全绿，且 0 个 JS 错误**：
+跑完整测试套件，**283 个用例必须全绿，且 0 个 JS 错误**：
 
 ```bash
-python tools/test_rules.py            # 35
-python tools/test_engine_browser.py   # 36
-python tools/test_io_browser.py       # 61
-python tools/test_e2e_browser.py      # 23
-python tools/test_smoke_size.py       # 结构冒烟
+python tools/test_rules.py              # 35
+python tools/test_engine_browser.py     # 41
+python tools/test_io_browser.py         # 61
+python tools/test_e2e_browser.py        # 23
+python tools/test_regression_browser.py # 36，全程 file://
+pip install openpyxl                    # 仅真实工作簿测试需要
+python tools/test_real_xlsx_browser.py  # 8
+python tools/test_transforms_browser.py # 25
+python tools/test_worker_browser.py     # 27；默认真实临时 12 万行 CSV
+python tools/test_cross_browser.py      # 27；Chromium / Firefox / WebKit
+python tools/test_smoke_size.py         # 结构冒烟
 ```
 
 浏览器测试会监听 `pageerror`。如果你的改动引入了未捕获异常，测试会失败 —— 这是刻意的。
@@ -50,7 +58,7 @@ python tools/test_smoke_size.py       # 结构冒烟
 
 - 2 空格缩进
 - 原生 DOM API，不用框架
-- 各层通过全局对象通信：`DCRules`（规则）、`DCIO`（读写）、`DCAI`（模型）
+- 各层通过全局对象通信：`DCRules`（规则）、`DCIO`（读写）、`DCAI`（模型）、`DCWorker`（后台任务）
 - 注释写"**为什么**"，而不是"做了什么"—— 尤其是处理格式怪癖的地方（比如为什么 `007` 必须存成文本）
 - 用户可见的文案用中文
 
@@ -59,11 +67,14 @@ python tools/test_smoke_size.py       # 结构冒烟
 | 文件 | 职责 | 不该出现的东西 |
 |---|---|---|
 | `js/rules.js` | 纯数据变换 | DOM 操作、网络请求 |
-| `js/io.js` | 解析与序列化 | DOM 操作（`DOMParser` 除外）、业务逻辑 |
+| `js/io.js` | 解析与序列化（含 Worker 安全 XML） | 页面 DOM 操作、业务逻辑 |
+| `js/worker.js` | Worker 任务、分块传输、缓存与取消 | 网络请求、AI Provider、业务配置 |
 | `js/ai.js` | Provider 与 Prompt | DOM 操作 |
 | `js/app.js` | UI 与状态 | 底层解析逻辑 |
 
 保持这个边界，测试才能脱离 UI 单独验证核心逻辑。
+
+`rules.js` 和 `io.js` 的工厂函数体会被序列化到 Blob Worker，**函数体必须自包含**；不要把工厂内的实现改成依赖页面闭包、DOM 或外部模块。XLSX 的轻量 XML 解析器也必须保持 Worker 安全，不能改回 `DOMParser`。修改这些文件后必须运行 Worker 和跨浏览器套件，不需要也不能引入生成 Worker 的构建步骤。
 
 ## 报告问题
 

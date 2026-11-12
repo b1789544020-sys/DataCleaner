@@ -1,18 +1,26 @@
 """Final smoke test: file existence + size + Python syntax + HTTP serve check."""
 import os, sys, subprocess, urllib.request, time
 
-BASE = r"C:\Users\86159\Desktop\DataCleanerProAI"
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 files = [
     ("index.html",             "Main HTML page"),
     ("css/style.css",          "Stylesheet"),
     ("js/rules.js",            "Rules engine"),
     ("js/io.js",               "IO: CSV/XLSX parsing, presets"),
+    ("js/worker.js",           "Worker tasks, streaming and cancellation"),
     ("js/ai.js",               "AI provider"),
     ("js/app.js",              "Main application"),
     ("README.md",              "Documentation"),
-    ("tools/test_engine_browser.py", "Browser engine test (36 cases)"),
+    ("CONTRIBUTING.md",        "Contributor guide"),
+    ("docs/screenshot.png",    "Current application screenshot"),
+    ("tools/test_engine_browser.py", "Browser engine test (41 cases)"),
     ("tools/test_io_browser.py",  "IO test: CSV/XLSX/presets/pager (61 cases)"),
     ("tools/test_e2e_browser.py", "End-to-end UI test (23 cases)"),
+    ("tools/test_regression_browser.py", "Data-safety/audit regressions (36 cases)"),
+    ("tools/test_transforms_browser.py", "High-frequency transformation tests (25 cases)"),
+    ("tools/test_worker_browser.py", "Worker/large-file/cache tests (27 cases)"),
+    ("tools/test_cross_browser.py", "Chromium/Firefox/WebKit tests (27 cases)"),
+    ("tools/test_real_xlsx_browser.py", "Real openpyxl workbook test (8 cases)"),
     ("tools/test_rules.py",     "Rule unit tests (35 cases)"),
     ("tools/test_smoke_size.py", "This smoke test"),
     ("LICENSE",                 "MIT license"),
@@ -38,10 +46,9 @@ print()
 
 # Python compile check
 print("Python syntax check:")
+test_files = [os.path.join(BASE, f) for f, _ in files if f.endswith(".py") and os.path.exists(os.path.join(BASE, f))]
 r = subprocess.run(
-    [sys.executable, "-m", "py_compile",
-     os.path.join(BASE, "tools/test_rules.py"),
-     os.path.join(BASE, "tools/test_smoke_size.py")],
+    [sys.executable, "-m", "py_compile"] + test_files,
     capture_output=True, text=True, timeout=10
 )
 if r.returncode == 0:

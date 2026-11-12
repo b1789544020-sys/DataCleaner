@@ -68,7 +68,7 @@ def main():
                   "sample data has 10 rows")
             check("示例数据" in page.locator("#file-info").inner_text(),
                   "file info shows sample file name")
-            check(page.locator(".rule-card").count() == 10, "10 rule cards rendered")
+            check(page.locator(".rule-card").count() == 14, "14 rule cards rendered (13 built-in + AI)")
 
             print()
             print("=" * 60)

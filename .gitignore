@@ -30,3 +30,8 @@ secrets.json
 
 # ---- Secrets ----
 .env
+
+# ---- 本地演示制作与行为探针 ----
+DataCleaner-demo-work/
+tools/_probe_gaps.py
+tools/_*.xlsx

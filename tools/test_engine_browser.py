@@ -34,7 +34,7 @@ def serve():
 
 # 在浏览器里跑完整断言，返回 [{ok, msg}, ...]
 SUITE = r"""
-() => {
+async () => {
   const R = window.DCRules;
   const AI = window.DCAI;
   const out = [];
@@ -142,6 +142,86 @@ SUITE = r"""
   // ---- Test 7: 质量分析 ----
   const issues = R.analyzeQuality(headers, rows);
   assert(issues.length > 0, '质量分析：示例数据能发现问题（共 ' + issues.length + ' 个）');
+
+  // ---- Test 8: WebLLM 协议（伪引擎，不下载真实模型）----
+  let capturedMessages = null;
+  const streamed = [];
+  const localEngine = {
+    chat: { completions: { create: async options => {
+      capturedMessages = options.messages;
+      return (async function* () {
+        yield { choices: [{ delta: { content: '{"analysis":"本地",' } }] };
+        yield { choices: [{ delta: { content: '"steps":[]}' } }] };
+      })();
+    } } },
+    interruptGenerate: () => Promise.resolve(),
+  };
+  window.webllm = { CreateMLCEngine: () => Promise.resolve(localEngine) };
+  window.__dcWebLLMEnginePromise = Promise.resolve(localEngine);
+  const local = await AI.chat({
+    provider: 'webllm', instruction: '改成 DD/MM/YYYY', headers, sampleRows: rows,
+    conversation: [{ role: 'user', content: '统一日期格式' }, { role: 'assistant', content: '{"steps":[]}' }],
+    onChunk: text => streamed.push(text),
+  });
+  assert(capturedMessages.length === 4 && capturedMessages[1].content === '统一日期格式'
+    && capturedMessages[2].role === 'assistant' && capturedMessages[3].content.includes('改成 DD/MM/YYYY'),
+  'WebLLM：保留多轮历史且不重复当前指令');
+  assert(local.fullText === '{"analysis":"本地","steps":[]}' && local.parsed.analysis === '本地'
+    && streamed[streamed.length - 1] === local.fullText,
+  'WebLLM：异步 token 流聚合和 JSON 解析正确');
+
+  let generationStarted, interruptionCount = 0;
+  const started = new Promise(resolve => { generationStarted = resolve; });
+  const waitingEngine = {
+    chat: { completions: { create: async () => {
+      generationStarted();
+      return { next: () => new Promise(() => {}) };
+    } } },
+    interruptGenerate: () => { interruptionCount++; return Promise.resolve(); },
+  };
+  window.__dcWebLLMEnginePromise = Promise.resolve(waitingEngine);
+  const controller = new AbortController();
+  const pending = AI.chat({ provider: 'webllm', instruction: '等待中', headers, sampleRows: rows,
+    signal: controller.signal });
+  await started;
+  controller.abort();
+  let abortName = '';
+  try { await pending; } catch (error) { abortName = error.name; }
+  assert(abortName === 'AbortError' && interruptionCount === 1,
+    'WebLLM：停止会中断挂起的推理并返回 AbortError');
+
+  let initializationStarted, lateProgress, staleProgressCount = 0;
+  const initializing = new Promise(resolve => { initializationStarted = resolve; });
+  window.webllm.CreateMLCEngine = (model, options) => {
+    lateProgress = options.initProgressCallback;
+    initializationStarted();
+    return new Promise(() => {});
+  };
+  window.__dcWebLLMEnginePromise = null;
+  const initController = new AbortController();
+  const initializingRequest = AI.chat({ provider: 'webllm', instruction: '首次加载', headers, sampleRows: rows,
+    signal: initController.signal, onProgress: () => { staleProgressCount++; } });
+  await initializing;
+  initController.abort();
+  let initializationAbortName = '';
+  try { await initializingRequest; } catch (error) { initializationAbortName = error.name; }
+  lateProgress({ text: '旧任务进度' });
+  assert(initializationAbortName === 'AbortError' && staleProgressCount === 0,
+    'WebLLM：首次模型加载可停止等待，旧进度不会覆盖取消状态');
+
+  let attempts = 0;
+  window.webllm.CreateMLCEngine = () => {
+    attempts++;
+    return attempts === 1 ? Promise.reject(new Error('模拟初始化失败')) : Promise.resolve(localEngine);
+  };
+  window.__dcWebLLMEnginePromise = null;
+  let initializationFailed = false;
+  try { await AI.initWebLLM(); } catch (error) { initializationFailed = true; }
+  const retriedEngine = await AI.initWebLLM();
+  assert(initializationFailed && attempts === 2 && retriedEngine === localEngine,
+    'WebLLM：初始化失败不污染缓存，可以重新初始化');
+  delete window.__dcWebLLMEnginePromise;
+  delete window.webllm;
 
   return out;
 }

@@ -1,10 +1,10 @@
 /* ============================================
    DataCleaner Pro · AI · 规则引擎
-   8 条内置规则 + AI 智能清洗（mask/normalize/fill/trim/dedupe/split/rename/delete/formula）
+   13 条内置规则 + AI 智能清洗（mask/normalize/fill/trim/dedupe/split/rename/delete/formula）
    每个规则：apply(headers, rows, opts) -> { headers, rows, changed, log }
    ============================================ */
 
-(function () {
+function createDCRules() {
   'use strict';
 
   // ---- 工具函数 ----
@@ -40,15 +40,60 @@
       const v = rows[i][colIdx];
       if (!isNull(v)) {
         total++;
-        const s = toStr(v).trim();
-        if (/^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}/.test(s) ||
-            /^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}/.test(s) ||
-            !isNaN(Date.parse(s))) {
-          dates++;
-        }
+        if (parseDateParts(v)) dates++;
       }
     }
     return total > 0 && dates / total > 0.6;
+  }
+
+  function isValidDateParts(y, m, d) {
+    if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d)) return false;
+    if (y < 1 || y > 9999 || m < 1 || m > 12 || d < 1) return false;
+    const leap = y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
+    const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    return d <= days[m - 1];
+  }
+
+  // 不用 new Date 猜测日期：它会悄悄把 2 月 30 日归一化成 3 月。
+  // 无歧义时沿用旧行为，把 05/06/2024 解释为 MM/DD/YYYY。
+  function parseDateParts(value) {
+    if (value instanceof Date) {
+      return isNaN(value.getTime()) ? null : { y: value.getFullYear(), m: value.getMonth() + 1, d: value.getDate() };
+    }
+    if (value === null || value === undefined) return null;
+    const s = String(value).trim();
+    let match = s.match(/^(\d{4})([-/.])(\d{1,2})\2(\d{1,2})(.*)$/);
+    let y, m, d;
+    if (match) {
+      y = Number(match[1]); m = Number(match[3]); d = Number(match[4]);
+    } else {
+      match = s.match(/^(\d{1,2})([-/.])(\d{1,2})\2(\d{4}|\d{2})(.*)$/);
+      if (!match) return null;
+      const first = Number(match[1]), second = Number(match[3]);
+      y = Number(match[4]);
+      if (y < 100) y += 2000;
+      if (first > 12) { d = first; m = second; }
+      else { m = first; d = second; }
+    }
+    const rest = match[5];
+    if (rest && rest.trim() !== '' && isNaN(Date.parse(s))) return null;
+    return isValidDateParts(y, m, d) ? { y, m, d } : null;
+  }
+
+  function formatDateParts(parts, targetFormat) {
+    const y = String(parts.y).padStart(4, '0');
+    const m = String(parts.m).padStart(2, '0');
+    const d = String(parts.d).padStart(2, '0');
+    if (targetFormat === 'DD/MM/YYYY') return d + '/' + m + '/' + y;
+    if (targetFormat === 'MM/DD/YYYY') return m + '/' + d + '/' + y;
+    if (targetFormat === 'YYYY/MM/DD') return y + '/' + m + '/' + d;
+    if (targetFormat === 'YYYY.MM.DD') return y + '.' + m + '.' + d;
+    return y + '-' + m + '-' + d;
+  }
+
+  function normalizeDate(s, targetFormat) {
+    const parts = parseDateParts(s);
+    return parts ? formatDateParts(parts, targetFormat) : String(s == null ? '' : s).trim();
   }
 
   // 查找列索引（按列名或索引）
@@ -57,6 +102,70 @@
     if (typeof col === 'number') return col >= 0 && col < headers.length ? col : -1;
     const idx = headers.indexOf(String(col));
     return idx;
+  }
+
+  const CONDITION_OPERATORS = new Set([
+    'equals', 'not_equals', 'contains', 'not_contains', 'empty', 'not_empty',
+    'gt', 'gte', 'lt', 'lte',
+  ]);
+
+  function strictNumber(value) {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : NaN;
+    const source = toStr(value).trim();
+    if (!source) return NaN;
+    // 数字比较不使用宽松的 toNum：不能把 "12abc" 当作 12。
+    let normalized = source;
+    if (/^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d*)?(?:[eE][+-]?\d+)?$/.test(source)) {
+      normalized = source.replace(/,/g, '');
+    }
+    if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(normalized)) return NaN;
+    const result = Number(normalized);
+    return Number.isFinite(result) ? result : NaN;
+  }
+
+  function conditionConfigured(operator, expected) {
+    if (!CONDITION_OPERATORS.has(operator)) return false;
+    if (operator === 'empty' || operator === 'not_empty') return true;
+    // 空字符串请显式使用 empty，避免未填条件时意外匹配或删除全表。
+    if (expected === undefined || expected === null || String(expected) === '') return false;
+    if (['gt', 'gte', 'lt', 'lte'].includes(operator)) return !isNaN(strictNumber(expected));
+    return true;
+  }
+
+  function matchesCondition(cell, operator, expected, caseSensitive) {
+    if (operator === 'empty') return isNull(cell);
+    if (operator === 'not_empty') return !isNull(cell);
+    if (['gt', 'gte', 'lt', 'lte'].includes(operator)) {
+      const left = strictNumber(cell), right = strictNumber(expected);
+      if (isNaN(left) || isNaN(right)) return false;
+      if (operator === 'gt') return left > right;
+      if (operator === 'gte') return left >= right;
+      if (operator === 'lt') return left < right;
+      return left <= right;
+    }
+    let left = toStr(cell), right = toStr(expected);
+    if (caseSensitive !== true) {
+      left = left.toLocaleLowerCase();
+      right = right.toLocaleLowerCase();
+    }
+    if (operator === 'equals') return left === right;
+    if (operator === 'not_equals') return left !== right;
+    if (operator === 'contains') return left.includes(right);
+    if (operator === 'not_contains') return !left.includes(right);
+    return false;
+  }
+
+  function uniqueHeaderName(base, headers, reusableIndices) {
+    const reusable = reusableIndices || new Set();
+    const unavailable = new Set(headers.filter((_, index) => !reusable.has(index)));
+    if (!unavailable.has(base)) return base;
+    let suffix = 2;
+    while (unavailable.has(base + '_' + suffix)) suffix++;
+    return base + '_' + suffix;
+  }
+
+  function sampleRowNumbers(rows) {
+    return rows.length <= 12 ? rows.join('、') : rows.slice(0, 12).join('、') + ' 等';
   }
 
   // ---- 规则 1: 清除空行/空列 ----
@@ -156,6 +265,46 @@
     }
   };
 
+  // ---- 空值标记标准化 ----
+  const ruleMissing = {
+    id: 'missing', name: '空值标记', desc: '把 N/A、NULL 等完整单元格标记统一转换', defaultOn: false,
+    apply(headers, rows, opts, ctx) {
+      const rawTokens = Array.isArray(opts.tokens) ? opts.tokens : String(opts.tokens || '').split(/\r?\n/);
+      const tokens = rawTokens.slice(0, 50).map(token => toStr(token).trim()).filter(token => token !== '');
+      const includeBlank = opts.includeBlank === true;
+      if (!tokens.length && !includeBlank) {
+        ctx.log('空值标记 · 跳过（未配置标记，且未选择处理空白）');
+        return { headers, rows, changed: new Set(), log: '' };
+      }
+      const targets = Array.isArray(opts.targets) && opts.targets.length
+        ? [...new Set(opts.targets.map(target => resolveCol(headers, target)).filter(index => index >= 0))]
+        : headers.map((_, index) => index);
+      const replacement = opts.replacement === undefined || opts.replacement === null ? '' : String(opts.replacement);
+      const normalizedTokens = tokens.map(token => opts.caseSensitive === true ? token : token.toLocaleLowerCase());
+      const changed = new Set();
+      const affectedRows = [];
+      let count = 0;
+      for (let i = 0; i < rows.length; i++) {
+        let rowChanged = false;
+        for (const j of targets) {
+          const original = rows[i][j];
+          const source = toStr(original).trim();
+          const comparable = opts.caseSensitive === true ? source : source.toLocaleLowerCase();
+          if (!((includeBlank && isNull(original)) || normalizedTokens.includes(comparable))) continue;
+          if (toStr(original) === replacement) continue;
+          rows[i][j] = replacement;
+          changed.add(`${i}:${j}`);
+          count++;
+          rowChanged = true;
+        }
+        if (rowChanged) affectedRows.push(i + 1);
+      }
+      ctx.log(`空值标记 · ${targets.length} 列 · 转换 ${count} 个单元格`
+        + (affectedRows.length ? ` · 数据行 ${sampleRowNumbers(affectedRows)}` : ''));
+      return { headers, rows, changed, log: '' };
+    },
+  };
+
   // ---- 规则 3: 文本清理 ----
   const ruleText = {
     id: 'text', name: '文本清理', desc: '去空格/去特殊字符/大小写', defaultOn: true,
@@ -213,13 +362,42 @@
     }
   };
 
+  // ---- 条件整格替换 ----
+  const ruleConditional = {
+    id: 'conditional', name: '条件替换', desc: '满足条件时替换目标列的完整单元格', defaultOn: false,
+    apply(headers, rows, opts, ctx) {
+      const column = resolveCol(headers, opts.column);
+      const targetColumn = resolveCol(headers, opts.targetColumn);
+      const operator = opts.operator || 'equals';
+      if (column < 0 || targetColumn < 0 || !conditionConfigured(operator, opts.value)) {
+        ctx.log('条件替换 · 跳过（请完整配置条件列、目标列、运算符和比较值）');
+        return { headers, rows, changed: new Set(), log: '' };
+      }
+      const replacement = opts.replaceWith === undefined || opts.replaceWith === null ? '' : String(opts.replaceWith);
+      const changed = new Set();
+      const affectedRows = [];
+      for (let i = 0; i < rows.length; i++) {
+        if (!matchesCondition(rows[i][column], operator, opts.value, opts.caseSensitive === true)) continue;
+        if (toStr(rows[i][targetColumn]) === replacement) continue;
+        rows[i][targetColumn] = replacement;
+        changed.add(`${i}:${targetColumn}`);
+        affectedRows.push(i + 1);
+      }
+      ctx.log(`条件替换 · 条件列 "${headers[column]}" · 目标列 "${headers[targetColumn]}" · 修改 ${affectedRows.length} 个单元格`
+        + (affectedRows.length ? ` · 数据行 ${sampleRowNumbers(affectedRows)}` : ''));
+      return { headers, rows, changed, log: '' };
+    },
+  };
+
   // ---- 规则 5: 拆分列 ----
   const ruleSplit = {
     id: 'split', name: '拆分列', desc: '按分隔符拆分列', defaultOn: false,
     apply(headers, rows, opts, ctx) {
-      const colIdx = parseInt(opts.colIdx, 10);
+      const colIdx = opts.column !== undefined
+        ? resolveCol(headers, opts.column)
+        : parseInt(opts.colIdx, 10);
       const sep = opts.sep || ',';
-      const maxParts = parseInt(opts.maxParts, 10) || 3;
+      const maxParts = Math.max(1, Math.min(20, parseInt(opts.maxParts, 10) || 3));
       if (isNaN(colIdx) || colIdx < 0 || colIdx >= headers.length) {
         ctx.log('拆分列 · 跳过（列未选）');
         return { headers, rows, changed: new Set(), log: '' };
@@ -240,37 +418,77 @@
     }
   };
 
+  // ---- 合并列 ----
+  const ruleMerge = {
+    id: 'merge', name: '合并列', desc: '按勾选顺序拼接多列，可保留原列', defaultOn: false,
+    apply(headers, rows, opts, ctx) {
+      const indices = Array.isArray(opts.columns)
+        ? [...new Set(opts.columns.map(column => resolveCol(headers, column)).filter(index => index >= 0))]
+        : [];
+      if (indices.length < 2) {
+        ctx.log('合并列 · 跳过（请至少选择两个有效列）');
+        return { headers, rows, changed: new Set(), log: '' };
+      }
+      const keepOriginal = opts.keepOriginal !== false;
+      const skipEmpty = opts.skipEmpty !== false;
+      const separator = opts.separator === undefined || opts.separator === null ? ' ' : String(opts.separator);
+      const requestedName = toStr(opts.newName).trim() || indices.map(index => headers[index]).join('_');
+      const outputName = uniqueHeaderName(requestedName, headers, keepOriginal ? new Set() : new Set(indices));
+      const sourceSet = new Set(indices);
+      const first = indices[0];
+      const newHeaders = [];
+      const newRows = rows.map(row => {
+        const parts = indices.map(index => row[index]);
+        const merged = (skipEmpty ? parts.filter(value => !isNull(value)) : parts).map(toStr).join(separator);
+        if (keepOriginal) return row.concat([merged]);
+        const output = [];
+        for (let j = 0; j < headers.length; j++) {
+          if (j === first) output.push(merged);
+          else if (!sourceSet.has(j)) output.push(row[j]);
+        }
+        return output;
+      });
+      if (keepOriginal) {
+        newHeaders.push(...headers, outputName);
+      } else {
+        for (let j = 0; j < headers.length; j++) {
+          if (j === first) newHeaders.push(outputName);
+          else if (!sourceSet.has(j)) newHeaders.push(headers[j]);
+        }
+      }
+      ctx.log(`合并列 · ${indices.map(index => headers[index]).join(' + ')} → "${outputName}" · `
+        + (keepOriginal ? '保留原列' : '移除原列') + ` · ${rows.length} 行`);
+      return { headers: newHeaders, rows: newRows, changed: new Set(), log: '' };
+    },
+  };
+
   // ---- 规则 6: 日期标准化 ----
   const ruleDate = {
     id: 'date', name: '日期标准化', desc: '把日期统一成 YYYY-MM-DD', defaultOn: false,
     apply(headers, rows, opts, ctx) {
       const changed = new Set();
-      let count = 0;
+      let count = 0, invalid = 0;
+      const invalidRows = [];
       const targets = opts.targets && opts.targets.length
         ? opts.targets.map(t => resolveCol(headers, t)).filter(i => i >= 0)
-        : headers.map((_, i) => i).filter(i => isDateColumn(rows, i));
+        : headers.map((_, i) => i).filter(i => isDateColumn(rows, i) || /date|日期|时间|入职|注册|创建|出生/i.test(headers[i]));
       for (const j of targets) {
         for (let i = 0; i < rows.length; i++) {
           const v = rows[i][j];
           if (isNull(v)) continue;
-          let s = toStr(v).trim();
-          if (/^\d{4}-\d{1,2}-\d{1,2}/.test(s)) {
-            const norm = s.replace(/^(\d{4})-(\d{1,2})-(\d{1,2}).*/, (m, y, mo, d) => y + '-' + String(mo).padStart(2, '0') + '-' + String(d).padStart(2, '0'));
-            if (norm !== v) { rows[i][j] = norm; changed.add(`${i}:${j}`); count++; }
+          const parts = parseDateParts(v);
+          if (!parts) {
+            invalid++;
+            if (invalidRows.length < 12) invalidRows.push(i + 1);
             continue;
           }
-          const d = new Date(s);
-          if (!isNaN(d.getTime())) {
-            const yyyy = d.getFullYear();
-            const mm = String(d.getMonth() + 1).padStart(2, '0');
-            const dd = String(d.getDate()).padStart(2, '0');
-            const norm = `${yyyy}-${mm}-${dd}`;
-            if (norm !== s) { rows[i][j] = norm; changed.add(`${i}:${j}`); count++; }
-          }
+          const norm = formatDateParts(parts, opts.targetFormat || 'YYYY-MM-DD');
+          if (norm !== v) { rows[i][j] = norm; changed.add(`${i}:${j}`); count++; }
         }
       }
-      ctx.log(`日期标准化 · ${targets.length} 列 · 标准化 ${count} 个单元格`);
-      return { headers, rows, changed, log: '' };
+      ctx.log(`日期标准化 · ${targets.length} 列 · 标准化 ${count} 个单元格`
+        + (invalid ? ` · 保留 ${invalid} 个无效日期（数据行 ${invalidRows.join('、')}）` : ''));
+      return { headers, rows, changed, invalidDates: invalid, log: '' };
     }
   };
 
@@ -312,7 +530,12 @@
   const ruleCols = {
     id: 'cols', name: '列选择', desc: '只保留指定列', defaultOn: false,
     apply(headers, rows, opts, ctx) {
-      const keep = (opts.keep || []).map(i => parseInt(i, 10)).filter(i => !isNaN(i) && i >= 0 && i < headers.length);
+      const keep = (opts.keep || []).map(value => {
+        const byName = resolveCol(headers, value);
+        if (byName >= 0) return byName;
+        const index = parseInt(value, 10);
+        return isNaN(index) ? -1 : index;
+      }).filter(i => i >= 0 && i < headers.length);
       if (keep.length === 0) {
         ctx.log('列选择 · 跳过（未选择列）');
         return { headers, rows, changed: new Set(), log: '' };
@@ -343,6 +566,118 @@
       return { headers, rows: kept, changed: new Set(), removedRows, log: '' };
     }
   };
+
+  // ---- 条件筛选行 ----
+  const ruleFilter = {
+    id: 'filter', name: '行筛选', desc: '保留或删除满足文本、空值、数值条件的行', defaultOn: false,
+    apply(headers, rows, opts, ctx) {
+      const column = resolveCol(headers, opts.column);
+      const operator = opts.operator || 'contains';
+      const action = opts.action || 'keep';
+      if (column < 0 || !conditionConfigured(operator, opts.value) || !['keep', 'remove'].includes(action)) {
+        ctx.log('行筛选 · 跳过（请完整配置列、运算符、比较值和保留/删除动作）');
+        return { headers, rows, changed: new Set(), log: '' };
+      }
+      const kept = [];
+      const removedRows = new Set();
+      const removedNumbers = [];
+      let matched = 0;
+      for (let i = 0; i < rows.length; i++) {
+        const matches = matchesCondition(rows[i][column], operator, opts.value, opts.caseSensitive === true);
+        if (matches) matched++;
+        const remove = action === 'keep' ? !matches : matches;
+        if (remove) {
+          removedRows.add(i);
+          removedNumbers.push(i + 1);
+        } else kept.push(rows[i]);
+      }
+      ctx.log(`行筛选 · "${headers[column]}" ${operator} · ${action === 'keep' ? '保留匹配行' : '删除匹配行'}`
+        + ` · 匹配 ${matched} 行 · 删除 ${removedRows.size} 行`
+        + (removedNumbers.length ? ` · 原数据行 ${sampleRowNumbers(removedNumbers)}` : ''));
+      return { headers, rows: kept, changed: new Set(), removedRows, log: '' };
+    },
+  };
+
+  // 受限算术语法：数字、col:N、+ - * /、括号和一元正负号。
+  // 编译为 AST 后逐行求值，不使用 eval / Function，也不提供任何对象或全局变量访问。
+  function compileArithmetic(expression, columnCount) {
+    const src = String(expression == null ? '' : expression);
+    if (src.length > 1000) throw new Error('公式不能超过 1000 个字符');
+    let pos = 0;
+    function skipSpace() { while (/\s/.test(src[pos] || '')) pos++; }
+    function parseExpression() {
+      let left = parseTerm();
+      while (true) {
+        skipSpace();
+        const op = src[pos];
+        if (op !== '+' && op !== '-') break;
+        pos++;
+        left = { kind: 'binary', op, left, right: parseTerm() };
+      }
+      return left;
+    }
+    function parseTerm() {
+      let left = parsePrimary();
+      while (true) {
+        skipSpace();
+        const op = src[pos];
+        if (op !== '*' && op !== '/') break;
+        pos++;
+        left = { kind: 'binary', op, left, right: parsePrimary() };
+      }
+      return left;
+    }
+    function parsePrimary() {
+      skipSpace();
+      const op = src[pos];
+      if (op === '+' || op === '-') {
+        pos++;
+        return { kind: 'unary', op, value: parsePrimary() };
+      }
+      if (op === '(') {
+        pos++;
+        const node = parseExpression();
+        skipSpace();
+        if (src[pos] !== ')') throw new Error('公式缺少右括号');
+        pos++;
+        return node;
+      }
+      if (src.slice(pos, pos + 4) === 'col:') {
+        pos += 4;
+        const match = src.slice(pos).match(/^\d+/);
+        if (!match) throw new Error('col: 后必须是列序号');
+        pos += match[0].length;
+        const index = Number(match[0]);
+        if (index < 0 || index >= columnCount) throw new Error('公式引用了不存在的 col:' + index);
+        return { kind: 'column', index };
+      }
+      const match = src.slice(pos).match(/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/);
+      if (!match) throw new Error('公式含不支持的语法（位置 ' + (pos + 1) + '）');
+      pos += match[0].length;
+      return { kind: 'number', value: Number(match[0]) };
+    }
+    if (!src.trim()) throw new Error('公式不能为空');
+    const ast = parseExpression();
+    skipSpace();
+    if (pos !== src.length) throw new Error('公式含不支持的语法（位置 ' + (pos + 1) + '）');
+    function evaluate(node, row) {
+      if (node.kind === 'number') return node.value;
+      if (node.kind === 'column') {
+        const n = toNum(row[node.index]);
+        return isNaN(n) ? 0 : n;
+      }
+      if (node.kind === 'unary') {
+        const n = evaluate(node.value, row);
+        return node.op === '-' ? -n : n;
+      }
+      const left = evaluate(node.left, row), right = evaluate(node.right, row);
+      if (node.op === '+') return left + right;
+      if (node.op === '-') return left - right;
+      if (node.op === '*') return left * right;
+      return left / right;
+    }
+    return row => evaluate(ast, row);
+  }
 
   // ---- AI 规则: 由 AI 生成的步骤序列动态执行 ----
   // 单步执行器（也可被 AI 规则多条步骤复用）
@@ -385,46 +720,26 @@
       if (colIdx < 0) throw new Error(`找不到列 "${opts.column}"`);
       const fmt = opts.target_format || 'YYYY-MM-DD';
       const changed = new Set();
-      let count = 0;
+      let count = 0, invalid = 0;
+      const invalidRows = [];
       for (let i = 0; i < rows.length; i++) {
         const v = rows[i][colIdx];
         if (isNull(v)) continue;
-        const s = toStr(v).trim();
-        let out = s;
-        // 解析多种格式
-        const d = new Date(s);
-        if (isNaN(d.getTime())) {
-          // 尝试 yyyy/mm/dd 或 dd/mm/yyyy
-          const m = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
-          if (m) {
-            out = `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
-          } else {
-            const m2 = s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})$/);
-            if (m2) {
-              const y = m2[3].length === 2 ? '20' + m2[3] : m2[3];
-              out = `${y}-${m2[1].padStart(2,'0')}-${m2[2].padStart(2,'0')}`;
-            } else {
-              continue;
-            }
-          }
-        } else {
-          const yyyy = d.getFullYear();
-          const mm = String(d.getMonth() + 1).padStart(2, '0');
-          const dd = String(d.getDate()).padStart(2, '0');
-          if (fmt === 'YYYY-MM-DD') out = `${yyyy}-${mm}-${dd}`;
-          else if (fmt === 'DD/MM/YYYY') out = `${dd}/${mm}/${yyyy}`;
-          else if (fmt === 'MM/DD/YYYY') out = `${mm}/${dd}/${yyyy}`;
-          else if (fmt === 'YYYY/MM/DD') out = `${yyyy}/${mm}/${dd}`;
-          else if (fmt === 'YYYY.MM.DD') out = `${yyyy}.${mm}.${dd}`;
-          else out = `${yyyy}-${mm}-${dd}`;
+        const parts = parseDateParts(v);
+        if (!parts) {
+          invalid++;
+          if (invalidRows.length < 12) invalidRows.push(i + 1);
+          continue;
         }
-        if (out !== s) {
+        const out = formatDateParts(parts, fmt);
+        if (out !== v) {
           rows[i][colIdx] = out;
           changed.add(`${i}:${colIdx}`); count++;
         }
       }
-      ctx.log(`  · [date] ${headers[colIdx]} → ${fmt} · 标准化 ${count} 个`);
-      return { count, changed };
+      ctx.log(`  · [date] ${headers[colIdx]} → ${fmt} · 标准化 ${count} 个`
+        + (invalid ? ` · 保留 ${invalid} 个无效日期（数据行 ${invalidRows.join('、')}）` : ''));
+      return { count, changed, invalidDates: invalid };
     },
     // 填充空值
     fill_empty(headers, rows, opts, ctx) {
@@ -538,35 +853,20 @@
       if (colIdx < 0) throw new Error(`找不到列 "${opts.column}"`);
       const expr = opts.formula || opts.expression;
       if (!expr) throw new Error('custom_formula 缺少 formula');
-      // 仅允许 数字 / + - * / ( ) . 空格 和变量 col:索引
-      if (!/^[\d+\-*/().\s,a-zA-Z_0-9:]+$/.test(expr)) throw new Error('公式包含不安全字符');
+      const evaluate = compileArithmetic(expr, headers.length);
       const changed = new Set();
-      let count = 0;
-      // 解析 col:N 引用
-      const refs = [];
-      const exp2 = expr.replace(/col:(\d+)/g, (_, idx) => {
-        refs.push(parseInt(idx, 10));
-        return '__c' + (refs.length - 1) + '__';
-      });
+      let count = 0, skipped = 0;
       for (let i = 0; i < rows.length; i++) {
-        try {
-          let body = exp2;
-          for (let k = 0; k < refs.length; k++) {
-            const v = rows[i][refs[k]];
-            const n = toNum(v);
-            body = body.split('__c' + k + '__').join(isNaN(n) ? '0' : String(n));
-          }
-          // eslint-disable-next-line no-new-func
-          const result = Function('"use strict"; return (' + body + ')')();
-          if (typeof result === 'number' && !isNaN(result)) {
+        const result = evaluate(rows[i]);
+        if (Number.isFinite(result)) {
+          if (rows[i][colIdx] !== result) {
             rows[i][colIdx] = result;
             changed.add(`${i}:${colIdx}`); count++;
           }
-        } catch (e) {
-          // 单行失败不抛
-        }
+        } else skipped++;
       }
-      ctx.log(`  · [formula] ${opts.column} = ${expr} · ${count} 个`);
+      ctx.log(`  · [formula] ${opts.column} = ${expr} · ${count} 个`
+        + (skipped ? ` · 跳过 ${skipped} 个非有限结果` : ''));
       return { count, changed };
     },
   };
@@ -607,7 +907,10 @@
   };
 
   // 暴露 AI 步骤执行器（供调试和工具使用）
-  const RULES = [ruleEmpty, ruleFill, ruleText, ruleReplace, ruleSplit, ruleDate, ruleNumber, ruleCols, ruleDedupe, ruleAI];
+  const RULES = [
+    ruleEmpty, ruleMissing, ruleFill, ruleText, ruleReplace, ruleConditional,
+    ruleSplit, ruleMerge, ruleDate, ruleNumber, ruleCols, ruleFilter, ruleDedupe, ruleAI,
+  ];
 
   // 兼容层：rule.run(headers, rows, opts) —— 单条规则独立调用（测试/脚本用）
   RULES.forEach(def => {
@@ -642,20 +945,12 @@
       if (!def) continue;
       onProgress && onProgress(idx / activeRules.length, ar.ruleId);
 
-      // 对 AI 规则：浅拷贝 curRows 让 AI 内部修改的是自己的数组（回滚友好）
-      let workingRows = curRows;
-      if (def.id === 'ai') {
-        workingRows = curRows.map(r => r.slice());
-      }
-      const workingHeaders = def.id === 'ai' ? curHeaders.slice() : curHeaders;
+      // 每一步都在副本上执行：调用方的原始数据永不被规则原地修改。
+      const workingRows = curRows.map(r => r.slice());
+      const workingHeaders = curHeaders.slice();
       const result = def.apply(workingHeaders, workingRows, ar.opts || {}, ctx);
-      if (def.id === 'ai') {
-        curHeaders = result.headers;
-        curRows = result.rows;
-      } else {
-        curHeaders = result.headers;
-        curRows = result.rows;
-      }
+      curHeaders = result.headers;
+      curRows = result.rows;
       if (result.changed) {
         result.changed.forEach(k => { allChanged.add(k); totalModified++; });
       }
@@ -707,61 +1002,106 @@
     return { added, deleted, modified };
   }
 
-  // 数据质量分析（用于 AI 自动修复建议）
-  function analyzeQuality(headers, rows) {
-    const issues = [];
-    if (!rows.length) return issues;
-    headers.forEach((h, j) => {
-      let nullCount = 0, total = 0;
-      const dateFormats = new Set();
-      const phoneLike = [];
-      const outliers = [];
-      let numericArr = [];
-      for (let i = 0; i < rows.length; i++) {
-        const v = rows[i][j];
-        total++;
-        if (isNull(v)) { nullCount++; continue; }
-        const s = toStr(v).trim();
-        // 日期格式多样性
-        if (/^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}/.test(s) || /^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}/.test(s)) {
-          // 提取分隔符
-          const sepMatch = s.match(/[-/.]/);
-          if (sepMatch) dateFormats.add(sepMatch[0]);
-        }
-        // 手机号识别
-        if (/^1[3-9]\d{9}$/.test(s.replace(/\D/g, '').length === 11 ? s : '')) {
-          phoneLike.push(i);
-        }
-        // 数字异常
-        const n = toNum(s);
-        if (!isNaN(n) && s !== '' && /[a-zA-Z一-龥]/.test(s) === false) {
-          numericArr.push(n);
-        }
-      }
-      const nullRate = nullCount / total;
-      if (nullRate > 0.1) {
-        issues.push({ column: h, type: 'missing', rate: nullRate.toFixed(2), message: `"${h}" 列有 ${(nullRate*100).toFixed(1)}% 空值` });
-      }
-      if (dateFormats.size > 1) {
-        issues.push({ column: h, type: 'date_inconsistent', formats: [...dateFormats].join(','), message: `"${h}" 列日期格式混用: ${[...dateFormats].join(',')}` });
-      }
-      // 数值离群
-      if (numericArr.length > 5) {
-        numericArr.sort((a, b) => a - b);
-        const q1 = numericArr[Math.floor(numericArr.length * 0.25)];
-        const q3 = numericArr[Math.floor(numericArr.length * 0.75)];
-        const iqr = q3 - q1;
-        const lo = q1 - 1.5 * iqr, hi = q3 + 1.5 * iqr;
-        const outCount = numericArr.filter(n => n < lo || n > hi).length;
-        if (outCount / numericArr.length > 0.05) {
-          issues.push({ column: h, type: 'outliers', count: outCount, message: `"${h}" 列有 ${outCount} 个离群值` });
-        }
-      }
-    });
-    return issues;
+  function dateFormatName(s) {
+    let m = s.match(/^(\d{4})([-/.])\d{1,2}\2\d{1,2}/);
+    if (m) return 'YYYY' + m[2] + 'MM' + m[2] + 'DD';
+    m = s.match(/^(\d{1,2})([-/.])(\d{1,2})\2(\d{4}|\d{2})/);
+    if (!m) return '';
+    return (Number(m[1]) > 12 ? 'DD' : 'MM') + m[2]
+      + (Number(m[1]) > 12 ? 'MM' : 'DD') + m[2] + 'YYYY';
   }
 
-  window.DCRules = {
-    RULES, runPipeline, computeDiff, analyzeQuality, AI_STEP_EXECUTORS,
+  // 同时返回可修复问题与逐列画像；报告和自动建议共用同一份分析，避免结论不一致。
+  function profileData(headers, rows) {
+    const issues = [], columns = [];
+    headers.forEach((h, j) => {
+      const unique = new Set(), missingRows = [], invalidDateRows = [];
+      const invalidEmailRows = [], invalidPhoneRows = [], formats = new Set(), numeric = [];
+      let nonEmpty = 0, validDates = 0, validEmails = 0, validPhones = 0, emailLike = 0;
+      for (let i = 0; i < rows.length; i++) {
+        const v = rows[i][j];
+        if (isNull(v)) { missingRows.push(i + 1); continue; }
+        nonEmpty++;
+        const s = toStr(v).trim();
+        unique.add(s);
+        const parts = parseDateParts(s);
+        if (parts) { validDates++; formats.add(dateFormatName(s)); }
+        else invalidDateRows.push(i + 1);
+        const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+        if (emailOk) validEmails++;
+        if (s.indexOf('@') >= 0) emailLike++;
+        if (!emailOk) invalidEmailRows.push(i + 1);
+        const phone = s.replace(/[\s-]/g, '').replace(/^\+86/, '');
+        if (!/^1[3-9]\d{9}$/.test(phone)) invalidPhoneRows.push(i + 1);
+        else validPhones++;
+        const numericText = s.replace(/[¥￥$€£,\s]/g, '');
+        if (/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(numericText)) {
+          numeric.push({ value: Number(numericText), row: i + 1 });
+        }
+      }
+      const dateHint = /date|日期|时间|入职|注册|创建|出生/i.test(h);
+      const emailHint = /e-?mail|邮箱|邮件/i.test(h);
+      const phoneHint = /phone|mobile|手机|电话|联系方式/i.test(h);
+      const isDate = isDateColumn(rows, j) || (dateHint && validDates + invalidDateRows.length > 0);
+      const isEmail = !isDate && (emailHint || (nonEmpty > 0 && (validEmails + emailLike) / nonEmpty > 0.6));
+      const isPhone = !isDate && !isEmail && (phoneHint || (nonEmpty > 0 && validPhones / nonEmpty > 0.6));
+      const isNumber = !isDate && !isEmail && !isPhone && nonEmpty > 0 && numeric.length / nonEmpty > 0.7;
+      const type = nonEmpty === 0 ? 'empty' : isDate ? 'date' : isEmail ? 'email' : isPhone ? 'phone' : isNumber ? 'number' : 'text';
+      const typeNames = { empty: '空列', date: '日期', email: '邮箱', phone: '手机号', number: '数字', text: '文本' };
+      const missingRate = rows.length ? missingRows.length / rows.length : 0;
+      const profile = {
+        column: h, columnIndex: j, type, typeName: typeNames[type], nonEmpty,
+        missingCount: missingRows.length, missingRate, uniqueCount: unique.size, invalidCount: 0,
+      };
+      if (missingRows.length && (missingRate > 0.1 || rows.length <= 10)) {
+        issues.push({ column: h, columnIndex: j, columnType: type, type: 'missing', count: missingRows.length,
+          rows: missingRows.slice(0, 50), rate: missingRate, message: `"${h}" 列有 ${(missingRate * 100).toFixed(1)}% 空值（${missingRows.length} 行）` });
+      }
+      if (formats.size > 1) {
+        issues.push({ column: h, columnIndex: j, type: 'date_inconsistent', formats: [...formats],
+          message: `"${h}" 列日期格式混用：${[...formats].join('、')}` });
+      }
+      const addInvalid = (kind, list, label) => {
+        if (!list.length) return;
+        profile.invalidCount += list.length;
+        issues.push({ column: h, columnIndex: j, type: kind, count: list.length, rows: list.slice(0, 50),
+          message: `"${h}" 列有 ${list.length} 个无效${label}（数据行 ${list.slice(0, 12).join('、')}），已保留原值` });
+      };
+      if (isDate) addInvalid('invalid_date', invalidDateRows, '日期');
+      if (isEmail) addInvalid('invalid_email', invalidEmailRows, '邮箱');
+      if (isPhone) addInvalid('invalid_phone', invalidPhoneRows, '手机号');
+      if (isNumber && numeric.length > 5) {
+        const sorted = numeric.map(n => n.value).sort((a, b) => a - b);
+        const q1 = sorted[Math.floor(sorted.length * 0.25)], q3 = sorted[Math.floor(sorted.length * 0.75)];
+        const iqr = q3 - q1, lo = q1 - 1.5 * iqr, hi = q3 + 1.5 * iqr;
+        const outlierRows = numeric.filter(n => n.value < lo || n.value > hi).map(n => n.row);
+        if (outlierRows.length / numeric.length > 0.05) {
+          issues.push({ column: h, columnIndex: j, type: 'outliers', count: outlierRows.length, rows: outlierRows,
+            message: `"${h}" 列有 ${outlierRows.length} 个离群值（仅提示，不自动修改）` });
+        }
+      }
+      columns.push(profile);
+    });
+    const seen = new Set(), duplicateRows = [];
+    rows.forEach((row, i) => {
+      const key = JSON.stringify(row.map(toStr));
+      if (seen.has(key)) duplicateRows.push(i + 1);
+      else seen.add(key);
+    });
+    if (duplicateRows.length) {
+      issues.unshift({ type: 'duplicates', count: duplicateRows.length, rows: duplicateRows,
+        message: `发现 ${duplicateRows.length} 行完全重复（重复数据行 ${duplicateRows.slice(0, 12).join('、')}）` });
+    }
+    return { issues, columns, summary: { rows: rows.length, columns: headers.length, duplicateRows: duplicateRows.length, issueCount: issues.length } };
+  }
+
+  function analyzeQuality(headers, rows) {
+    return profileData(headers, rows).issues;
+  }
+
+  return {
+    RULES, runPipeline, computeDiff, analyzeQuality, profileData, AI_STEP_EXECUTORS,
+    parseDateParts, normalizeDate, compileArithmetic,
   };
-})();
+}
+window.DCRules = createDCRules();

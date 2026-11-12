@@ -3,44 +3,52 @@
    职责：把「文件」变成 { headers, rows }
    - 分隔符嗅探（, \t ; |）
    - CSV/TSV 字符流解析（正确支持字段内换行、转义引号）
-   - XLSX 解析（零依赖：DecompressionStream + DOMParser）
+   - XLSX 解析（零依赖：DecompressionStream + 自包含 XML 解析器）
    - 预设序列化
    零依赖，可离线（file:// 亦可运行）
    ============================================ */
 
-(function () {
+function createDCIO() {
   'use strict';
 
-  // ---- 分隔符嗅探：只统计引号外的候选字符 ----
+  // ---- 分隔符嗅探：按多行字段数一致性评分，而不是统计单个字符 ----
   const CANDIDATES = [',', '\t', ';', '|'];
 
   function sniffDelimiter(text) {
-    const sample = text.slice(0, 64 * 1024);
-    const counts = {};
-    CANDIDATES.forEach(c => { counts[c] = 0; });
-    let inQ = false;
-    for (let i = 0; i < sample.length; i++) {
-      const c = sample[i];
-      if (c === '"') {
-        if (inQ && sample[i + 1] === '"') { i++; continue; }
-        inQ = !inQ;
-        continue;
-      }
-      if (inQ) continue;
-      if (counts.hasOwnProperty(c)) counts[c]++;
-    }
-    let best = ',', bestN = -1;
-    CANDIDATES.forEach(c => {
-      if (counts[c] > bestN) { bestN = counts[c]; best = c; }
+    const sample = String(text == null ? '' : text).slice(0, 64 * 1024);
+    let best = '';
+    let bestScore = -Infinity;
+    CANDIDATES.forEach(delim => {
+      const parsed = parseDelimited(sample, delim);
+      if (parsed.length < 2 || parsed[0].length < 2) return;
+      const headerWidth = parsed[0].length;
+      const frequencies = new Map();
+      let matchingHeader = 0;
+      parsed.forEach(row => {
+        frequencies.set(row.length, (frequencies.get(row.length) || 0) + 1);
+        if (row.length === headerWidth) matchingHeader++;
+      });
+      let modeWidth = 0, modeCount = 0;
+      frequencies.forEach((count, width) => {
+        if (width > 1 && count > modeCount) { modeWidth = width; modeCount = count; }
+      });
+      if (modeWidth < 2) return;
+      // 表头也必须能分出多列。这样 hello, world 这类单列文本不会被拆散。
+      // 列数不一致的 CSV 仍会被选中，之后由 tableFromRows 保留字段并报告异常。
+      const score = (matchingHeader / parsed.length) * 1000
+        + (modeCount / parsed.length) * 100
+        + Math.min(headerWidth, 20);
+      if (score > bestScore) { bestScore = score; best = delim; }
     });
-    return bestN > 0 ? best : ',';
+    // 空字符串是显式的“单列”模式，不能回退成逗号。
+    return best;
   }
 
   // ---- 核心：字符流扫描 ----
   // 与旧实现的关键区别：不再先按 \n 切行，因此带换行的引号字段不会被劈开。
   function parseDelimited(text, delim) {
     text = String(text == null ? '' : text).replace(/^\uFEFF/, '');
-    if (!delim) delim = sniffDelimiter(text);
+    if (delim === undefined || delim === null) delim = sniffDelimiter(text);
 
     const rows = [];
     let row = [];
@@ -70,7 +78,7 @@
 
       if (c === '"') { inQ = true; sawAny = true; continue; }
 
-      if (c === delim) { row.push(cur); cur = ''; sawAny = true; continue; }
+      if (delim !== '' && c === delim) { row.push(cur); cur = ''; sawAny = true; continue; }
 
       if (c === '\r' || c === '\n') {
         if (c === '\r' && text[i + 1] === '\n') i++;
@@ -93,21 +101,61 @@
     return rows;
   }
 
-  // ---- 表格化：首行为表头，补齐/截断使每行列数一致 ----
+  // ---- 表格化：保留所有字段；短行补空，长行自动补表头并报告 ----
   function tableFromRows(rows) {
-    if (!rows.length) return { headers: [], rows: [] };
-    const headers = rows[0].map((h, i) => {
-      const s = String(h == null ? '' : h).trim();
-      return s === '' ? '列' + (i + 1) : s;
-    });
+    if (!rows.length) {
+      return { headers: [], rows: [], stats: { irregularRows: [], extendedColumns: 0, headerColumns: 0 } };
+    }
+    const headerColumns = rows[0].length;
+    const width = rows.reduce((max, row) => Math.max(max, row.length), 0);
+    const headers = [];
+    for (let i = 0; i < width; i++) {
+      const raw = i < headerColumns ? rows[0][i] : '';
+      const s = String(raw == null ? '' : raw).trim();
+      let name = s === '' ? '列' + (i + 1) : s;
+      let suffix = 2;
+      while (headers.indexOf(name) >= 0 && s === '') name = '列' + (i + 1) + '_' + suffix++;
+      headers.push(name);
+    }
+    const irregularRows = [];
     const body = [];
     for (let i = 1; i < rows.length; i++) {
       const r = rows[i];
-      const out = new Array(headers.length);
-      for (let j = 0; j < headers.length; j++) out[j] = r[j] == null ? '' : r[j];
+      if (r.length !== headerColumns || r.length !== width) {
+        irregularRows.push({ row: i + 1, expected: headerColumns, actual: r.length });
+      }
+      const out = new Array(width);
+      for (let j = 0; j < width; j++) out[j] = r[j] == null ? '' : r[j];
       body.push(out);
     }
-    return { headers: headers, rows: body };
+    return {
+      headers,
+      rows: body,
+      stats: {
+        irregularRows,
+        extendedColumns: Math.max(0, width - headerColumns),
+        headerColumns,
+      },
+    };
+  }
+
+  // 解码放在 Worker 内执行；逐字符计数避免为正则匹配结果再分配一个大数组。
+  function decodeText(buffer) {
+    const decode = encoding => new TextDecoder(encoding, { fatal: false }).decode(buffer);
+    const replacements = text => {
+      let count = 0;
+      for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 0xFFFD) count++;
+      return count;
+    };
+    let text = decode('utf-8'), encoding = 'utf-8';
+    const bad = replacements(text);
+    if (bad > 0) {
+      try {
+        const gbk = decode('gbk');
+        if (replacements(gbk) < bad) { text = gbk; encoding = 'gbk'; }
+      } catch (_) { /* 浏览器不支持 GBK 时保留 UTF-8 结果。 */ }
+    }
+    return { text: text.replace(/^\uFEFF/, ''), encoding };
   }
 
   function parseCSV(text, delim) {
@@ -232,8 +280,137 @@
     return `${y}-${mo}-${dd}`;
   }
 
+  // DOMParser 不在 Worker 中提供。这里只实现 XLSX 所需的最小只读 XML 树，
+  // 不加载 DTD 或外部实体；接口与现有解析代码使用的 DOM 子集保持一致。
+  function xmlDecode(value) {
+    return String(value).replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (entity, code) => {
+      const named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+      if (named[code.toLowerCase()] !== undefined) return named[code.toLowerCase()];
+      const radix = code[1].toLowerCase() === 'x' ? 16 : 10;
+      const digits = radix === 16 ? code.slice(2) : code.slice(1);
+      const point = parseInt(digits, radix);
+      if (!Number.isFinite(point) || point < 0 || point > 0x10FFFF) return entity;
+      try { return String.fromCodePoint(point); } catch (_) { return entity; }
+    });
+  }
+
+  function XMLNode(name) {
+    this.name = name;
+    this.attributes = Object.create(null);
+    this.children = [];
+    this.content = [];
+  }
+  Object.defineProperty(XMLNode.prototype, 'textContent', {
+    get: function () {
+      return this.content.map(item => typeof item === 'string' ? item : item.textContent).join('');
+    },
+  });
+  XMLNode.prototype.getAttribute = function (name) {
+    if (Object.prototype.hasOwnProperty.call(this.attributes, name)) return this.attributes[name];
+    const local = String(name).split(':').pop();
+    const key = Object.keys(this.attributes).find(key => key.split(':').pop() === local);
+    return key === undefined ? null : this.attributes[key];
+  };
+  XMLNode.prototype.getElementsByTagName = function (name) {
+    const found = [];
+    function visit(node) {
+      if (name === '*' || node.name === name || node.name.split(':').pop() === name) found.push(node);
+      node.children.forEach(visit);
+    }
+    this.children.forEach(visit);
+    return found;
+  };
+
   function parseX(xml) {
-    return new DOMParser().parseFromString(xml, 'application/xml');
+    const documentNode = new XMLNode('#document');
+    try {
+      const source = String(xml == null ? '' : xml).replace(/^\uFEFF/, '');
+      const stack = [documentNode];
+      const appendText = text => { if (text) stack[stack.length - 1].content.push(xmlDecode(text)); };
+      let offset = 0;
+      while (offset < source.length) {
+        const start = source.indexOf('<', offset);
+        if (start < 0) { appendText(source.slice(offset)); break; }
+        appendText(source.slice(offset, start));
+        if (source.startsWith('<!--', start)) {
+          const end = source.indexOf('-->', start + 4);
+          if (end < 0) throw new Error('未闭合的 XML 注释');
+          offset = end + 3;
+          continue;
+        }
+        if (source.startsWith('<![CDATA[', start)) {
+          const end = source.indexOf(']]>', start + 9);
+          if (end < 0) throw new Error('未闭合的 CDATA');
+          const text = source.slice(start + 9, end);
+          if (text) stack[stack.length - 1].content.push(text);
+          offset = end + 3;
+          continue;
+        }
+        if (source.startsWith('<?', start)) {
+          const end = source.indexOf('?>', start + 2);
+          if (end < 0) throw new Error('未闭合的 XML 声明');
+          offset = end + 2;
+          continue;
+        }
+        if (/^<!DOCTYPE/i.test(source.slice(start, start + 9))) {
+          throw new Error('XLSX XML 不允许 DOCTYPE 或外部实体');
+        }
+        let end = start + 1, quote = '';
+        for (; end < source.length; end++) {
+          const char = source[end];
+          if (quote) { if (char === quote) quote = ''; }
+          else if (char === '"' || char === "'") quote = char;
+          else if (char === '>') break;
+        }
+        if (end >= source.length) throw new Error('未闭合的 XML 标签');
+        let tag = source.slice(start + 1, end).trim();
+        offset = end + 1;
+        if (!tag || tag[0] === '!') continue;
+        if (tag[0] === '/') {
+          const closing = tag.slice(1).trim();
+          if (stack.length === 1 || stack[stack.length - 1].name !== closing) {
+            throw new Error('XML 闭合标签不匹配：' + closing);
+          }
+          stack.pop();
+          continue;
+        }
+        const selfClosing = /\/\s*$/.test(tag);
+        if (selfClosing) tag = tag.replace(/\/\s*$/, '').trim();
+        const nameMatch = tag.match(/^([^\s/>]+)/);
+        if (!nameMatch) throw new Error('XML 标签缺少名称');
+        const node = new XMLNode(nameMatch[1]);
+        let cursor = nameMatch[0].length;
+        while (cursor < tag.length) {
+          while (/\s/.test(tag[cursor])) cursor++;
+          if (cursor >= tag.length) break;
+          const attr = tag.slice(cursor).match(/^([^\s=/>]+)/);
+          if (!attr) throw new Error('无效 XML 属性');
+          cursor += attr[0].length;
+          while (/\s/.test(tag[cursor])) cursor++;
+          if (tag[cursor] !== '=') throw new Error('XML 属性缺少等号：' + attr[1]);
+          cursor++;
+          while (/\s/.test(tag[cursor])) cursor++;
+          const delimiter = tag[cursor++];
+          if (delimiter !== '"' && delimiter !== "'") throw new Error('XML 属性必须使用引号');
+          const valueEnd = tag.indexOf(delimiter, cursor);
+          if (valueEnd < 0) throw new Error('XML 属性引号未闭合');
+          node.attributes[attr[1]] = xmlDecode(tag.slice(cursor, valueEnd));
+          cursor = valueEnd + 1;
+        }
+        const parent = stack[stack.length - 1];
+        parent.children.push(node);
+        parent.content.push(node);
+        if (!selfClosing) stack.push(node);
+      }
+      if (stack.length !== 1) throw new Error('XML 标签未闭合：' + stack[stack.length - 1].name);
+      return documentNode;
+    } catch (error) {
+      const failure = new XMLNode('#document'), parserError = new XMLNode('parsererror');
+      parserError.content.push(error.message || String(error));
+      failure.children.push(parserError);
+      failure.content.push(parserError);
+      return failure;
+    }
   }
 
   // 共享字符串表：<si> 内可能有多个 <t>（富文本分段），需拼接
@@ -351,7 +528,7 @@
       if (!xml) xml = await zipReadText(zip, 'xl/worksheets/sheet' + (i + 1) + '.xml');
       if (!xml) continue;
       const tbl = tableFromRows(sheetToRows(xml, shared, dateStyles));
-      sheets.push({ name: name, headers: tbl.headers, rows: tbl.rows });
+      sheets.push({ name: name, headers: tbl.headers, rows: tbl.rows, stats: tbl.stats });
     }
     if (!sheets.length) throw new Error('未在工作簿中找到任何工作表');
     return { sheets: sheets };
@@ -539,6 +716,17 @@
   }
 
   // 构建 xlsx Blob。sheetName 会被清理成 Excel 允许的形式。
+  function buildCSV(headers, rows) {
+    const escape = value => {
+      if (value === null || value === undefined) return '';
+      const text = String(value);
+      return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+    };
+    const lines = [headers.map(escape).join(',')];
+    rows.forEach(row => lines.push(row.map(escape).join(',')));
+    return new Blob(['\uFEFF' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  }
+
   function buildXLSX(headers, rows, sheetName) {
     let name = String(sheetName || 'Sheet1').replace(/[\[\]\*\/\\\?:]/g, '_').slice(0, 31);
     if (!name) name = 'Sheet1';
@@ -579,7 +767,7 @@
       + '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
       + '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
       + '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
-      + '</styleSheet>';
+      + '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>';
 
     return zipCreate([
       { name: '[Content_Types].xml', text: ct },
@@ -593,7 +781,7 @@
 
   // ---- 预设序列化（第 2 项用）----
   function serializePresets(presets) {
-    return JSON.stringify({ v: 1, presets: presets }, null, 2);
+    return JSON.stringify({ v: 2, presets: presets }, null, 2);
   }
 
   function deserializePresets(text) {
@@ -603,10 +791,13 @@
     return list.filter(p => p && typeof p.name === 'string' && Array.isArray(p.rules));
   }
 
-  window.DCIO = {
+  return {
     sniffDelimiter: sniffDelimiter,
+    decodeText: decodeText,
     parseDelimited: parseDelimited,
     parseCSV: parseCSV,
+    buildCSV: buildCSV,
+    parseXML: parseX,
     tableFromRows: tableFromRows,
     parseXLSX: parseXLSX,
     buildXLSX: buildXLSX,
@@ -618,5 +809,6 @@
     serializePresets: serializePresets,
     deserializePresets: deserializePresets,
   };
-})();
+}
+window.DCIO = createDCIO();
 
